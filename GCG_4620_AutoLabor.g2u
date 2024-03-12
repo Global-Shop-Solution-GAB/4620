@@ -1,0 +1,175 @@
+Program.Sub.Preflight.Start
+
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start	
+F.Intrinsic.Control.Try
+	V.Local.sSQL.Declare(String)
+	V.Local.sJobSuffix.Declare(String)
+	V.Local.sJob.Declare(String)
+	V.Local.sSuffix.Declare(String)
+	V.Local.sSeq.Declare(String)
+	V.Local.sOpCode.Declare(String)
+	V.Local.fRate.Declare(Float)
+	V.Local.iDuration.Declare(Long)
+	
+	'15755 = OLS001 Scan Post Hook
+	'15935 = Post Start Job Hook
+	f.Intrinsic.Control.If(V.Caller.Hook,=,15755,"OR",V.Caller.Hook,=,15935)
+		F.ODBC.Connection!con.OpenConnection(V.Ambient.PDSN,V.Ambient.PUser,V.Ambient.PPass,60)
+		
+		F.Intrinsic.Control.If(V.Caller.Hook,=,15935)
+			'V.Passed.000003 = Job-Suffix
+			'V.Passed.009002 = Seq
+			f.Intrinsic.String.Split(Variable.Passed.000003,"-",V.Local.sJobSuffix)
+			V.Local.sJob.Set(V.Local.sJobSuffix(0))
+			V.Local.sSuffix.Set(V.Local.sJobSuffix(1))
+			V.Local.sSeq.Set(V.Passed.009002)
+		
+		F.Intrinsic.Control.ElseIf(V.Caller.Hook,=,15755)
+			'V.Passed.009990 = Job
+			'V.Passed.009991 = Suffix
+			'V.Passed.009992 = Seq
+			V.Local.sJob.Set(V.Passed.009990)
+			V.Local.sSuffix.Set(V.Passed.009991)
+			V.Local.sSeq.Set(V.Passed.009992)
+		F.Intrinsic.Control.EndIf
+		
+		'Retrieve the OpCode for the specified Job
+		F.Intrinsic.String.Build("SELECT Operation FROM V_Job_Operations_WC WHERE Job = '{0}' AND Suffix = '{1}' AND Seq = '{2}'",V.Local.sJob,V.Local.sSuffix,V.Local.sSeq,V.Local.sSQL)
+		F.ODBC.Connection!con.OpenLocalRecordSetRO("rstOpCode",V.Local.sSQL)
+		'Verify return isn't empty in case of weird edge cases
+		F.Intrinsic.Control.If(V.ODBC.con!rstOpCode.EOF,=,True)
+			F.ODBC.con!rstOpCode.Close
+			F.Intrinsic.Control.CallSub(UnLoad)
+		F.Intrinsic.Control.EndIf
+		
+		V.Local.sOpCode.Set(V.ODBC.con!rstOpCode.FieldValTrim!Operation)
+		F.ODBC.con!rstOpCode.Close
+		
+		'Retrieve rate and duration for the matching opcode for the job
+		f.Intrinsic.String.Build("SELECT Rate, Duration_Min FROM GCG_4620_AutoLabor WHERE OpCode = '{0}'",V.Local.sOpCode,v.Local.sSQL)
+		F.ODBC.Connection!con.OpenRecordsetRO("rstGCG",V.Local.sSQL)
+		'If the return is empty then the job we clocked into does not contain a matching record in the custom table so we don't want to do anything. We exit accordingly. Otherwise we retrieve the rate and duration for the opcode
+		F.Intrinsic.Control.If(V.ODBC.con!rstGCG.EOF,=,True)
+			F.ODBC.con!rstGCG.Close
+			F.Intrinsic.Control.CallSub(UnLoad)
+		F.Intrinsic.Control.EndIf
+		
+		V.Local.fRate.Set(V.ODBC.con!rstGCG.FieldValFloat!Rate)
+		V.Local.iDuration.Set(V.ODBC.con!rstGCG.FieldValLong!Duration_Min)
+		F.ODBC.con!rstGCG.Close
+		
+		'Retrieve start date, start time, and workcenter for the job
+		F.Intrinsic.String.Build("SELECT Start_Date, Start_Time, Workcenter FROM V_Jobs_In_Process_G WHERE Job = '{0}' AND Suffix = '{1}' AND Seq = '{2}'",V.Local.sJob,V.Local.sSuffix,V.Local.sSeq,V.Local.sSQL)
+		F.ODBC.Connection!con.OpenLocalRecordsetRO("rstJob",V.Local.sSQL)
+		'Verify return isn't empty - this will happen if the script is run from the Scan Post Hook and the scan is clocking out instead of clocking in.
+		F.Intrinsic.Control.If(V.ODBC.con!rstJob.EOF,=,True)
+			F.ODBC.con!rstJob.Close
+			F.Intrinsic.Control.CallSub(UnLoad)
+		F.Intrinsic.Control.EndIf
+		
+		f.Intrinsic.Control.CallSub(Builddata,"Job",V.Local.sJob,"Suffix",V.Local.sSuffix,"SEQ",V.Local.sSeq,"WC",v.ODBC.con!rstJob.FieldVal!Workcenter,"Rate",V.Local.fRate,"StartDate",v.ODBC.con!rstJob.FieldVal!Start_Date,"StartDateTime",v.ODBC.con!rstJob.FieldVal!Start_Time,"Duration",V.Local.iDuration)
+		
+		F.ODBC.con!rstJob.Close
+		F.Intrinsic.Control.CallSub(UnLoad)
+		
+	f.Intrinsic.Control.EndIf
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(WriteErrorLog, "Sub", V.Ambient.CurrentSubroutine, "ErrNo", V.Ambient.ErrorNumber, "ErrDesc", V.Ambient.ErrorDescription)
+	F.Intrinsic.Control.CallSub(UnLoad)
+F.Intrinsic.Control.EndTry
+Program.Sub.Main.End
+
+Program.Sub.BuildData.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String)
+	
+	V.Local.sFile.Declare(String)
+	V.Local.sString.Declare(String)
+	V.Local.sDate.Declare(String)
+	V.Local.bEx.Declare(Boolean)
+	V.Local.dTempDate.Declare(Date)
+	V.Local.sStartTime.Declare(string)
+	V.Local.sEndTime.Declare(string)
+	V.Local.sRate.Declare(String)
+	
+	F.Intrinsic.String.Format(V.Args.StartDateTime,"MMDDYY",V.Local.sDate)
+	
+	'Formats start time and end time as NNSS and calculates end time as Start Time + Duration Minutes
+	Function.Intrinsic.String.TimeString(V.Args.StartDateTime, V.Local.sStartTime)
+	Function.Intrinsic.Date.Dateadd("N", v.Args.Duration,V.Args.StartDateTime,V.Local.dTempDate)
+	Function.Intrinsic.String.TimeString(V.Local.dTempDate,V.Local.sEndTime)
+		
+	Function.Intrinsic.String.Format(v.Args.Rate,"####.0000", V.local.sRate)
+		
+	'MOPEN file-layout - tab-delimited
+	'1 Date
+	'2 Employee
+	'3 Job
+	'4 Suffix
+	'5 Seq
+	'6 Workcenter
+	'7 Hours
+	'8 Closed
+	'9 Indirect
+	'10 Start Time
+	'11 Finish Time
+	'12 Rate Type
+	'13 Good Pieces
+	'14 Scrap Pieces
+	'15 Scrap Reason
+	'16 Employee Rate
+	F.Intrinsic.String.Build("{1}{0}{2}{0}{3}{0}{4}{0}{5}{0}{6}{0}{7}{0}{8}{0}{9}{0}{10}",V.Ambient.Tab,V.Local.sDate,99999,V.Args.Job,V.Args.Suffix,V.Args.Seq,V.Args.WC,"","N","D",V.Local.sStartTime,V.local.sString)
+	F.Intrinsic.String.Build("{7}{0}{1}{0}{2}{0}{3}{0}{4}{0}{5}{0}{6}",V.Ambient.Tab,V.Local.sEndTime,"R","0","0","0",V.local.sRate,V.Local.sString,V.Local.sString)
+	
+	F.Intrinsic.String.Build("{0}\{1}{2}MOPEN.TXT",V.Caller.FilesDir,V.Caller.CompanyCode,V.Caller.Terminal,V.Local.sFile)
+	
+	F.Intrinsic.File.Exists(V.Local.sFile,V.Local.bEx)
+	Function.Intrinsic.Control.If(V.Local.bEx,=,True)
+		F.Intrinsic.File.DeleteFile(V.Local.sFile)
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.File.String2File(V.Local.sFile,V.Local.sString)
+	
+	F.Intrinsic.String.Concat(V.Caller.CompanyCode,V.Caller.Terminal,"MOPEN.txt",V.Local.sFile)
+	F.Intrinsic.Task.LaunchGSSSync("JB0455","-C",V.Local.sFile)
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(WriteErrorLog, "Sub", V.Ambient.CurrentSubroutine, "ErrNo", V.Ambient.ErrorNumber, "ErrDesc", V.Ambient.ErrorDescription)
+	F.Intrinsic.Control.CallSub(UnLoad)
+F.Intrinsic.Control.EndTry
+Program.Sub.BuildData.End
+
+Program.Sub.WriteErrorLog.Start
+F.Intrinsic.Control.Try
+	V.Local.sFilePath.Declare(String)
+	V.Local.sFileContent.Declare(String)
+	V.Local.bFileExists.Declare(Boolean)
+	
+	F.Intrinsic.String.Build("{0}\GCG_4620_AutoLabor_Errors.txt",V.Caller.GasDir,V.Local.sFilePath)
+	F.Intrinsic.String.Build("Error in Project: GCG_4620_AutoLabor.g2u.{0}Error {1} occurred in sub {2} with description: {3}. Error occured at {4} on {5}.{0}",V.Ambient.NewLine,V.Args.ErrNo,V.Args.Sub,V.Args.ErrDesc,V.Ambient.Time,V.Ambient.Date,V.Local.sFileContent)
+	
+	F.Intrinsic.File.Exists(V.Local.sFilePath,V.Local.bFileExists)
+	
+	F.Intrinsic.Control.If(V.Local.bFileExists)
+		F.Intrinsic.File.Append2File(V.Local.sFilePath,V.Local.sFileContent)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.String2File(V.Local.sFilePath,V.Local.sFileContent)
+	F.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(UnLoad)
+F.Intrinsic.Control.EndTry
+Program.Sub.WriteErrorLog.End
+
+Program.Sub.UnLoad.Start
+F.ODBC.Connection!con.Close 
+F.Intrinsic.Control.End
+Program.Sub.UnLoad.End
+
+Program.Sub.Comments.Start
+${$0$}$Labor Upload$}$RAN$}$7/18/2017 10:07:03 AM$}$True
+${$3$}$0$}$$}$0$}$-1$}$$}$12:00:00 AM$}$This project will create Labor records based off the OP Code when an employee clocks into a Work Order Labor Sequence.
+Program.Sub.Comments.End
